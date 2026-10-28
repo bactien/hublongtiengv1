@@ -307,6 +307,15 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 progress_callback=tracker.update
             )
 
+            if out_video_path == "NO_AUDIO":
+                await status_msg.edit_text(
+                    "⚠️ **Video này của con vợ KHÔNG CÓ ÂM THANH!**\n\n"
+                    "Video này (đặc biệt là video tải từ Facebook/TikTok qua các trang web download) bị thiếu luồng tiếng (không có Audio track).\n"
+                    "Con vợ kiểm tra lại xem video gốc có phát ra tiếng không, hoặc gửi video khác có âm thanh người nói vào nhé ha ha!",
+                    parse_mode=constants.ParseMode.MARKDOWN
+                )
+                return
+
             if not out_video_path or not os.path.exists(out_video_path):
                 await status_msg.edit_text(
                     "⚠️ **Không phát hiện giọng nói nào trong video của con vợ!**\n"

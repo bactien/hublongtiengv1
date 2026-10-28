@@ -289,6 +289,22 @@ def change_audio_speed(input_path: str, output_path: str, speed_factor: float):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 
+def check_video_has_audio(video_path: str) -> bool:
+    """Kiểm tra xem file video có luồng âm thanh hay không bằng ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return "audio" in res.stdout.lower()
+    except Exception:
+        return True
+
+
 def process_video(
     input_video: str,
     output_dir: str = "output",
@@ -323,13 +339,25 @@ def process_video(
     print("▶ [Bước 1/6] Trích xuất âm thanh từ video gốc...")
     if progress_callback:
         progress_callback(1, 6, "Trích xuất âm thanh từ video gốc...")
+
+    # Kiểm tra xem video có tiếng hay không
+    if not check_video_has_audio(input_video):
+        print("⚠️ Cảnh báo: Video không chứa luồng âm thanh (Audio stream)!")
+        return "NO_AUDIO", None, None
+
     orig_wav = os.path.join(temp_dir, "original_audio.wav")
     cmd_extract = [
         "ffmpeg", "-y", "-i", input_video,
         "-vn", "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "2",
         orig_wav
     ]
-    subprocess.run(cmd_extract, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    res_extract = subprocess.run(cmd_extract, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res_extract.returncode != 0:
+        err_msg = res_extract.stderr.lower()
+        if "does not contain any stream" in err_msg or "matches no streams" in err_msg:
+            print("⚠️ Cảnh báo: Video không có âm thanh!")
+            return "NO_AUDIO", None, None
+        raise RuntimeError(f"Lỗi FFmpeg khi trích xuất âm thanh: {res_extract.stderr.strip()[:200]}")
 
     orig_data, sample_rate = sf.read(orig_wav)
     total_samples = len(orig_data)
@@ -499,7 +527,20 @@ def process_video(
             out_video_path
         ]
 
-    subprocess.run(cmd_mux, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    res_mux = subprocess.run(cmd_mux, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res_mux.returncode != 0:
+        print(f"⚠️ Thử ghép video không dán subtitle do lỗi: {res_mux.stderr.strip()[:100]}")
+        cmd_fallback = [
+            "ffmpeg", "-y",
+            "-i", input_video,
+            "-i", final_wav_path,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest",
+            out_video_path
+        ]
+        subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
     print("\n=======================================================")
     print("🎉 HOÀN TẤT THÀNH CÔNG!")
