@@ -4,10 +4,14 @@ import time
 import shutil
 import asyncio
 import logging
+import subprocess
+import uuid
+import re
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 import uvicorn
 
@@ -316,6 +320,140 @@ def delete_processed_folder(dir_name: str):
     raise HTTPException(status_code=404, detail="Thư mục không tồn tại")
 
 
+# Quản lý tác vụ Text To Speech
+TTS_JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def split_text_into_chunks(text: str, max_chars: int = 180) -> List[str]:
+    """Tách văn bản dài thành các đoạn nhỏ tự nhiên theo câu (., ?, !, \n, ;, ,) để chống timeout và đảm bảo chất lượng âm thanh."""
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks = []
+    for para in paragraphs:
+        sentences = re.split(r'(?<=[.?!;:])\s+', para)
+        current = ""
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            if len(s) > max_chars:
+                parts = re.split(r'(?<=[,])\s+', s)
+                for part in parts:
+                    if len(current) + len(part) + 1 <= max_chars:
+                        current = (current + " " + part).strip()
+                    else:
+                        if current:
+                            chunks.append(current)
+                        current = part
+            else:
+                if len(current) + len(s) + 1 <= max_chars:
+                    current = (current + " " + s).strip()
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = s
+        if current:
+            chunks.append(current)
+    return chunks if chunks else [text]
+
+
+def run_tts_worker(job_id: str, text: str, voice: str, speed: float = 1.0, temperature: float = 0.8, custom_ref_path: Optional[str] = None):
+    """Worker chạy nền xử lý văn bản dài thành giọng nói VieNeu-TTS không gây nghẽn kết nối."""
+    try:
+        job = TTS_JOBS.get(job_id)
+        if not job:
+            return
+
+        job["status"] = "processing"
+        job["message"] = "Đang phân tích văn bản và chia đoạn..."
+        job["progress"] = 5
+
+        chunks = split_text_into_chunks(text, max_chars=180)
+        total_chunks = len(chunks)
+        job["total_chunks"] = total_chunks
+
+        model = get_vieneu_model()
+        actual_voice = VOICE_MAP.get(voice, voice)
+        if actual_voice not in model._preset_voices and "ngan" in actual_voice.lower():
+            actual_voice = "Thanh Bình"
+
+        audio_segments = []
+        silence = np.zeros(int(48000 * 0.22), dtype=np.float32)
+
+        for idx, chunk in enumerate(chunks, 1):
+            pct = int(5 + (idx / total_chunks) * 85)
+            job["progress"] = pct
+            job["message"] = f"Đang đọc đoạn {idx}/{total_chunks} ({pct}%)..."
+
+            infer_kwargs = {
+                "temperature": float(temperature),
+            }
+            if custom_ref_path and Path(custom_ref_path).exists():
+                infer_kwargs["ref_audio"] = str(custom_ref_path)
+            else:
+                infer_kwargs["voice"] = actual_voice
+
+            chunk_audio = model.infer(chunk, **infer_kwargs)
+            if chunk_audio is not None and len(chunk_audio) > 0:
+                audio_segments.append(chunk_audio)
+                if idx < total_chunks:
+                    audio_segments.append(silence)
+
+        job["progress"] = 92
+        job["message"] = "Đang ghép nối và hoàn thiện file âm thanh..."
+
+        if not audio_segments:
+            raise ValueError("Không tạo được âm thanh từ văn bản cung cấp.")
+
+        full_audio = np.concatenate(audio_segments)
+
+        timestamp = int(time.time())
+        safe_voice = voice.replace(" ", "_") if not custom_ref_path else "Cloned_Voice"
+        raw_filename = f"raw_{timestamp}_{safe_voice}.wav"
+        raw_filepath = TTS_DIR / raw_filename
+
+        out_filename = f"tts_{timestamp}_{safe_voice}.wav"
+        out_filepath = TTS_DIR / out_filename
+
+        model.save(full_audio, str(raw_filepath))
+
+        # Điều chỉnh tốc độ nói nếu khác 1.0
+        if abs(float(speed) - 1.0) > 0.02:
+            job["message"] = f"Đang điều chỉnh tốc độ nói {speed}x..."
+            cmd = ["ffmpeg", "-y", "-i", str(raw_filepath), "-filter:a", f"atempo={speed}", str(out_filepath)]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            if raw_filepath.exists():
+                raw_filepath.unlink()
+        else:
+            if out_filepath.exists():
+                out_filepath.unlink()
+            raw_filepath.rename(out_filepath)
+
+        # Xóa file mẫu tạm
+        if custom_ref_path and Path(custom_ref_path).exists():
+            try:
+                Path(custom_ref_path).unlink()
+            except Exception:
+                pass
+
+        stat = out_filepath.stat()
+        job["status"] = "completed"
+        job["progress"] = 100
+        job["message"] = f"Đã tạo giọng đọc {voice} thành công!"
+        job["filename"] = out_filename
+        job["stream_url"] = f"/stream-tts/{out_filename}"
+        job["download_url"] = f"/download-tts/{out_filename}"
+        job["size_mb"] = round(stat.st_size / (1024 * 1024), 2)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        job = TTS_JOBS.get(job_id)
+        if job:
+            job["status"] = "failed"
+            job["message"] = f"Lỗi tạo giọng đọc: {str(e)}"
+            job["error"] = str(e)
+
+
 # ==========================================
 # API ENDPOINTS: TEXT TO SPEECH (TTS)
 # ==========================================
@@ -327,37 +465,63 @@ def api_tts_list():
 
 @app.post("/api/tts")
 async def api_create_tts(
+    background_tasks: BackgroundTasks,
     text: str = Form(...),
-    voice: str = Form("Adam bựa")
+    voice: str = Form("Adam bựa"),
+    speed: float = Form(1.0),
+    temperature: float = Form(0.8),
+    custom_ref: Optional[UploadFile] = File(None)
 ):
-    """Chuyển văn bản thành giọng nói bằng VieNeu-TTS."""
+    """Khởi tạo tác vụ Text To Speech bất đồng bộ, hỗ trợ văn bản dài không lo timeout."""
     clean_text = text.strip()
     if not clean_text:
         raise HTTPException(status_code=400, detail="Văn bản không được để trống!")
 
-    timestamp = int(time.time())
-    safe_voice = voice.replace(" ", "_")
-    out_filename = f"tts_{timestamp}_{safe_voice}.wav"
-    out_filepath = TTS_DIR / out_filename
+    job_id = f"tts_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    custom_ref_path = None
+    if custom_ref and custom_ref.filename:
+        ext = Path(custom_ref.filename).suffix or ".wav"
+        ref_file = TTS_DIR / f"ref_{job_id}{ext}"
+        with open(ref_file, "wb") as f:
+            shutil.copyfileobj(custom_ref.file, f)
+        custom_ref_path = str(ref_file)
 
-    def _generate():
-        model = get_vieneu_model()
-        actual_voice = VOICE_MAP.get(voice, voice)
-        if actual_voice not in model._preset_voices and "ngan" in actual_voice.lower():
-            actual_voice = "Thanh Bình"
-        audio = model.infer(clean_text, voice=actual_voice)
-        model.save(audio, str(out_filepath))
+    TTS_JOBS[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "message": "Đang xếp hàng tạo giọng đọc...",
+        "voice": voice if not custom_ref_path else "Custom Cloned Voice",
+        "text_preview": clean_text[:60] + "..." if len(clean_text) > 60 else clean_text,
+        "stream_url": None,
+        "download_url": None,
+        "error": None,
+        "created_at": time.time(),
+    }
 
-    await asyncio.to_thread(_generate)
+    background_tasks.add_task(
+        run_tts_worker,
+        job_id,
+        clean_text,
+        voice,
+        speed,
+        temperature,
+        custom_ref_path
+    )
 
     return {
         "success": True,
-        "filename": out_filename,
-        "voice": voice,
-        "stream_url": f"/stream-tts/{out_filename}",
-        "download_url": f"/download-tts/{out_filename}",
-        "message": f"Tạo giọng đọc {voice} thành công!"
+        "job_id": job_id,
+        "message": "Đã bắt đầu tác vụ tạo giọng đọc trong nền."
     }
+
+
+@app.get("/api/tts/status/{job_id}")
+def api_get_tts_status(job_id: str):
+    """Lấy trạng thái và tiến độ xử lý của tác vụ TTS."""
+    if job_id not in TTS_JOBS:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ TTS")
+    return TTS_JOBS[job_id]
 
 
 @app.get("/stream-tts/{filename}")
@@ -810,25 +974,71 @@ def index_page():
             <div class="form-group" style="margin-bottom:14px;">
               <label>Chọn Giọng Đọc</label>
               <select name="voice" id="ttsVoiceSelect">
-                <optgroup label="🌟 Giọng Nổi Tiếng & Yêu Thích">
-                  <option value="Nguyễn Ngọc Ngạn">🎙️ Nguyễn Ngọc Ngạn (Kể chuyện miền Nam rùng rợn, truyền cảm)</option>
-                  <option value="Thiện Tâm">🎙️ Thiện Tâm (Kể chuyện miền Bắc, đạo lý, triết lý sống)</option>
-                  <option value="Ngọc Huyền">🎙️ Ngọc Huyền (Nữ miền Bắc truyền cảm, tự nhiên)</option>
-                  <option value="Adam bựa" selected>🦜 Adam bựa (Hot Streamer VieNeu-TTS)</option>
+                <optgroup label="🌟 Giọng Nổi Tiếng & Hot Nhất">
+                  <option value="Nguyễn Ngọc Ngạn">🎙️ Nguyễn Ngọc Ngạn (Kể chuyện đêm khuya, Paris By Night)</option>
+                  <option value="Adam bựa" selected>🦜 Adam bựa (Hot Streamer VieNeu-TTS, troll hài hước)</option>
+                  <option value="Thiện Tâm">🧘 Thiền Tâm Đức (Thiện Tâm - Triết lý sống, đọc sách, đạo lý)</option>
+                  <option value="Ngọc Huyền">🌸 Ngọc Huyền (Nữ miền Bắc truyền cảm, tự nhiên, MC)</option>
                 </optgroup>
-                <optgroup label="📻 Các Giọng Khác">
+                <optgroup label="🍁 Giọng Miền Bắc">
+                  <option value="Trúc Ly">🎙️ Trúc Ly (Nữ Bắc · Giọng đọc tự nhiên, êm dịu)</option>
+                  <option value="Mai Anh">🎙️ Mai Anh (Nữ Bắc · Tin tức thời sự)</option>
+                  <option value="Quỳnh Anh">🎙️ Quỳnh Anh (Nữ Bắc · Đọc truyện đêm muộn)</option>
+                  <option value="Đoan Trang">🎙️ Đoan Trang (Nữ Bắc · Nhẹ nhàng tình cảm)</option>
+                  <option value="Ngọc Linh">🎙️ Ngọc Linh (Nữ Bắc · Kể chuyện)</option>
+                  <option value="Thiện Minh">🎙️ Thiện Minh (Nam Bắc · Kể chuyện sâu lắng)</option>
+                  <option value="Thanh Bình">🎙️ Thanh Bình (Nam Bắc · Đọc truyện)</option>
+                  <option value="Hải Đăng">🎙️ Hải Đăng (Nam Bắc · Tự nhiên, trẻ trung)</option>
+                  <option value="Xuân Vĩnh">🎙️ Xuân Vĩnh (Nam Bắc · Tự nhiên)</option>
+                  <option value="Phạm Tuyên">🎙️ Phạm Tuyên (Nam Bắc · Trầm ấm)</option>
+                  <option value="Quốc Tuấn">🎙️ Quốc Tuấn (Nam Bắc · Đĩnh đạc)</option>
+                  <option value="Minh Đức">🎙️ Minh Đức (Nam Bắc · Tin tức)</option>
+                </optgroup>
+                <optgroup label="🌴 Giọng Miền Nam">
+                  <option value="Thái Sơn">🎙️ Thái Sơn (Nam Nam · Phong cách kể chuyện Nam Bộ)</option>
+                  <option value="Minh Triết">🎙️ Minh Triết (Nam Nam · Phong cách tin tức)</option>
+                  <option value="Đức Trí">🎙️ Đức Trí (Nam Nam · Phong cách đọc truyện)</option>
+                  <option value="Thùy Dung">🎙️ Thùy Dung (Nữ Nam · Tin tức truyền hình)</option>
+                  <option value="Mỹ Duyên">🎙️ Mỹ Duyên (Nữ Nam · Đọc truyện tình cảm)</option>
+                  <option value="Thục Đoan">🎙️ Thục Đoan (Nữ Nam · Kể chuyện)</option>
+                  <option value="Kim Thanh">🎙️ Kim Thanh (Nữ Nam · Đọc sách)</option>
                   <option value="Adam chuẩn">🎙️ Adam chuẩn (Nam Nam · Tự nhiên)</option>
-                  <option value="Mai Anh">🎙️ Mai Anh (Nữ Bắc · Tin tức)</option>
-                  <option value="Hải Đăng">🎙️ Hải Đăng (Nam Bắc · Tự nhiên)</option>
-                  <option value="Thùy Dung">🎙️ Thùy Dung (Nữ Nam · Tin tức)</option>
-                  <option value="Quang Sơn">🎙️ Quang Sơn (Nam Trung)</option>
-                  <option value="Ngọc Trân">🎙️ Ngọc Trân (Nữ Trung)</option>
-                  <option value="Mỹ Duyên">🎙️ Mỹ Duyên (Nữ Nam · Đọc truyện)</option>
-                  <option value="Quỳnh Anh">🎙️ Quỳnh Anh (Nữ Bắc · Đọc truyện)</option>
-                  <option value="Đức Trí">🎙️ Đức Trí (Nam Nam · Đọc truyện)</option>
-                  <option value="Kim Thanh">🎙️ Kim Thanh (Nữ Nam · Đọc truyện)</option>
+                </optgroup>
+                <optgroup label="🌾 Giọng Miền Trung">
+                  <option value="Quang Sơn">🎙️ Quang Sơn (Nam Trung · Phong cách tự nhiên)</option>
+                  <option value="Ngọc Trân">🎙️ Ngọc Trân (Nữ Trung · Dịu dàng, truyền cảm)</option>
                 </optgroup>
               </select>
+            </div>
+
+            <!-- Tinh chỉnh thông số nâng cao -->
+            <div class="form-row" style="margin-bottom:14px;">
+              <div class="form-group">
+                <label>⚡ Tốc Độ Nói (Speed)</label>
+                <select name="speed">
+                  <option value="0.85">🐢 0.85x (Chậm rãi, truyền cảm)</option>
+                  <option value="1.0" selected>⚡ 1.0x (Chuẩn tự nhiên - Mặc định)</option>
+                  <option value="1.15">🚀 1.15x (Hơi nhanh)</option>
+                  <option value="1.25">🔥 1.25x (Nhanh, năng động)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>🎭 Độ Biểu Cảm (Temperature)</label>
+                <select name="temperature">
+                  <option value="0.6">👔 0.6 (Đều đặn, nghiêm túc - Tin tức, bài báo)</option>
+                  <option value="0.8" selected>🌟 0.8 (Tự nhiên, cân bằng - Mặc định)</option>
+                  <option value="1.0">🔥 1.0 (Giàu cảm xúc, kịch tính, sống động)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Nhân bản giọng nói Voice Clone -->
+            <div class="form-group" style="margin-bottom:14px; background:rgba(99,102,241,0.06); border:1px dashed rgba(99,102,241,0.3); border-radius:10px; padding:12px;">
+              <label style="color:#818cf8; font-weight:600;">🎙️ Nhân Bản Giọng Tức Thì (Instant Voice Clone - Tùy chọn)</label>
+              <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">
+                Tải lên file ghi âm mẫu (3 - 10 giây .wav/.mp3) của bất kỳ ai để clone đọc ngay đoạn văn dưới đây:
+              </div>
+              <input type="file" name="custom_ref" accept="audio/*" style="font-size:12px; color:var(--text-muted);">
             </div>
 
             <div class="form-group" style="margin-bottom:10px;">
@@ -843,8 +1053,8 @@ def index_page():
             </div>
 
             <div class="form-group" style="margin-bottom:16px;">
-              <label>Nội Dung Văn Bản Tiếng Việt</label>
-              <textarea id="ttsTextInput" name="text" rows="7" placeholder="Nhập hoặc dán đoạn văn bản, truyện ma, bài review hoặc lời thoại bạn muốn đọc vào đây..." required></textarea>
+              <label>Nội Dung Văn Bản Tiếng Việt (Hỗ trợ văn bản dài, tự động chia đoạn mượt mà)</label>
+              <textarea id="ttsTextInput" name="text" rows="7" placeholder="Nhập hoặc dán đoạn văn bản, truyện ma, bài review hoặc lời thoại bạn muốn đọc vào đây... (Không giới hạn độ dài, hệ thống sẽ tự động chia đoạn đọc mượt mà không lo bị ngắt quãng)" required></textarea>
               <div style="font-size:12px; color:var(--text-muted); margin-top:4px; text-align:right;">
                 <span id="charCount">0</span> ký tự
               </div>
@@ -853,6 +1063,17 @@ def index_page():
             <button type="submit" class="btn" id="ttsSubmitBtn">
               <span>🔊 Tạo Giọng Đọc Ngay (VieNeu-TTS)</span>
             </button>
+
+            <!-- TTS Progress Box -->
+            <div id="ttsProgressBox" style="display:none; margin-top:16px; background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:16px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <span id="ttsProgressMsg" style="font-size:13px; font-weight:600; color:var(--text);">⏳ Đang khởi tạo...</span>
+                <span id="ttsProgressPct" style="font-size:13px; font-weight:700; color:var(--primary);">0%</span>
+              </div>
+              <div style="height:8px; border-radius:4px; background:rgba(255,255,255,0.1); overflow:hidden;">
+                <div id="ttsProgressBar" style="height:100%; width:0%; background:linear-gradient(90deg, #6366f1, #a855f7); border-radius:4px; transition:width 0.4s ease;"></div>
+              </div>
+            </div>
           </form>
 
           <div class="tts-player-box" id="ttsPlayerBox">
@@ -1067,6 +1288,11 @@ def index_page():
     const ttsAudioPlayer = document.getElementById('ttsAudioPlayer');
     const ttsDownloadBtn = document.getElementById('ttsDownloadBtn');
     const charCount = document.getElementById('charCount');
+    const ttsProgressBox = document.getElementById('ttsProgressBox');
+    const ttsProgressMsg = document.getElementById('ttsProgressMsg');
+    const ttsProgressPct = document.getElementById('ttsProgressPct');
+    const ttsProgressBar = document.getElementById('ttsProgressBar');
+    let ttsPollTimer = null;
 
     ttsTextInput.addEventListener('input', () => {
       charCount.textContent = ttsTextInput.value.length;
@@ -1088,25 +1314,75 @@ def index_page():
 
       const formData = new FormData(ttsForm);
       ttsSubmitBtn.disabled = true;
-      ttsSubmitBtn.innerHTML = '<span>⏳ Đang sinh giọng đọc AI...</span>';
+      ttsSubmitBtn.innerHTML = '<span>⏳ Đang khởi chạy tác vụ...</span>';
+
+      ttsProgressBox.style.display = 'block';
+      ttsProgressMsg.textContent = '⏳ Đang khởi tạo và xếp hàng tác vụ...';
+      ttsProgressPct.textContent = '0%';
+      ttsProgressBar.style.width = '0%';
+      ttsProgressBar.style.background = 'linear-gradient(90deg, #6366f1, #a855f7)';
+      ttsPlayerBox.style.display = 'none';
 
       try {
         const resp = await fetch('/api/tts', { method: 'POST', body: formData });
         const data = await resp.json();
-        if (data.success) {
-          ttsAudioPlayer.src = data.stream_url;
-          ttsDownloadBtn.href = data.download_url;
-          ttsPlayerBox.style.display = 'block';
-          ttsAudioPlayer.play();
-          loadTtsFiles();
-        } else {
-          alert('Lỗi tạo giọng đọc: ' + JSON.stringify(data));
+
+        if (!data.success || !data.job_id) {
+          alert('Không thể tạo tác vụ: ' + (data.detail || data.message || JSON.stringify(data)));
+          ttsSubmitBtn.disabled = false;
+          ttsSubmitBtn.innerHTML = '<span>🔊 Tạo Giọng Đọc Ngay (VieNeu-TTS)</span>';
+          ttsProgressBox.style.display = 'none';
+          return;
         }
+
+        const jobId = data.job_id;
+        ttsSubmitBtn.innerHTML = '<span>🔄 AI Đang Đọc Văn Bản...</span>';
+
+        // Poll tiến độ mỗi 1.5 giây, không bao giờ bị timeout
+        if (ttsPollTimer) clearInterval(ttsPollTimer);
+        ttsPollTimer = setInterval(async () => {
+          try {
+            const statusRes = await fetch(`/api/tts/status/${jobId}`);
+            if (!statusRes.ok) return;
+            const job = await statusRes.json();
+
+            ttsProgressMsg.textContent = job.message || 'Đang xử lý...';
+            ttsProgressPct.textContent = `${job.progress || 0}%`;
+            ttsProgressBar.style.width = `${job.progress || 0}%`;
+
+            if (job.status === 'completed') {
+              clearInterval(ttsPollTimer);
+              ttsPollTimer = null;
+              ttsSubmitBtn.disabled = false;
+              ttsSubmitBtn.innerHTML = '<span>🔊 Tạo Giọng Đọc Ngay (VieNeu-TTS)</span>';
+              ttsProgressMsg.textContent = '🎉 Hoàn tất tạo âm thanh!';
+              ttsProgressBar.style.width = '100%';
+              ttsProgressBar.style.background = 'var(--success)';
+
+              ttsAudioPlayer.src = job.stream_url;
+              ttsDownloadBtn.href = job.download_url;
+              ttsPlayerBox.style.display = 'block';
+              ttsAudioPlayer.play().catch(() => {});
+              loadTtsFiles();
+            } else if (job.status === 'failed') {
+              clearInterval(ttsPollTimer);
+              ttsPollTimer = null;
+              ttsSubmitBtn.disabled = false;
+              ttsSubmitBtn.innerHTML = '<span>🔊 Tạo Giọng Đọc Ngay (VieNeu-TTS)</span>';
+              ttsProgressMsg.textContent = '❌ Lỗi: ' + (job.error || job.message);
+              ttsProgressBar.style.background = 'var(--danger)';
+              alert('Lỗi khi đọc văn bản: ' + (job.error || job.message));
+            }
+          } catch (pollErr) {
+            console.error('Lỗi kiểm tra tiến độ TTS:', pollErr);
+          }
+        }, 1500);
+
       } catch (err) {
-        alert('Lỗi kết nối: ' + err);
-      } finally {
         ttsSubmitBtn.disabled = false;
         ttsSubmitBtn.innerHTML = '<span>🔊 Tạo Giọng Đọc Ngay (VieNeu-TTS)</span>';
+        ttsProgressBox.style.display = 'none';
+        alert('Lỗi kết nối khi gửi yêu cầu: ' + err);
       }
     });
 
