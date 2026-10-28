@@ -27,6 +27,7 @@ temp/
 *.mov
 !e2e-tests/*.mp4
 !samples/*.mp4
+!samples/voices/*.wav
 
 # Sub-repositories
 VieNeu-TTS/
