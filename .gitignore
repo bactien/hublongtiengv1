@@ -1,0 +1,38 @@
+# Environment & Secrets (TUYỆT ĐỐI KHÔNG COMMIT TOKEN/API KEY)
+.env
+*.env.local
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Media downloads, temporary files and rendered outputs
+downloads/
+output/
+temp/
+*.wav
+*.mp3
+*.mkv
+*.mov
+!e2e-tests/*.mp4
+!samples/*.mp4
+
+# Sub-repositories
+VieNeu-TTS/
+
+# IDE & OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
