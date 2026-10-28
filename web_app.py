@@ -51,6 +51,18 @@ def get_vieneu_model():
     if VIENEU_MODEL is None:
         from vieneu import Vieneu
         VIENEU_MODEL = Vieneu()
+        ref_path = Path(__file__).parent / "samples" / "voices" / "nguyen_ngoc_ngan.wav"
+        if "Nguyễn Ngọc Ngạn" not in VIENEU_MODEL._preset_voices and ref_path.exists():
+            try:
+                VIENEU_MODEL.add_voice(
+                    "Nguyễn Ngọc Ngạn",
+                    str(ref_path),
+                    description="MC Nguyễn Ngọc Ngạn - Giọng kể chuyện Paris By Night",
+                    gender="Nam",
+                    save=True
+                )
+            except Exception as e:
+                print(f"Warning: could not register Nguyễn Ngọc Ngạn: {e}")
     return VIENEU_MODEL
 
 
@@ -331,6 +343,8 @@ async def api_create_tts(
     def _generate():
         model = get_vieneu_model()
         actual_voice = VOICE_MAP.get(voice, voice)
+        if actual_voice not in model._preset_voices and "ngan" in actual_voice.lower():
+            actual_voice = "Thanh Bình"
         audio = model.infer(clean_text, voice=actual_voice)
         model.save(audio, str(out_filepath))
 

@@ -34,8 +34,8 @@ def format_srt_time(seconds: float) -> str:
 
 VOICE_MAP = {
     "Adam bựa": "Adam bựa",
-    "Nguyễn Ngọc Ngạn": "Thái Sơn",
-    "Ngọc Ngạn": "Thái Sơn",
+    "Nguyễn Ngọc Ngạn": "Nguyễn Ngọc Ngạn",
+    "Ngọc Ngạn": "Nguyễn Ngọc Ngạn",
     "Thiện Tâm": "Thiền Tâm Đức",
     "Thiền Tâm Đức": "Thiền Tâm Đức",
     "Ngọc Huyền": "Ngọc Huyền",
@@ -464,6 +464,20 @@ def process_video(
         print(f"\n▶ [Bước 4/6] Khởi tạo mô hình VieNeu-TTS (Giọng: {voice} -> {actual_voice})...")
         from vieneu import Vieneu
         vieneu_model = Vieneu()
+        ref_path = Path(__file__).parent / "samples" / "voices" / "nguyen_ngoc_ngan.wav"
+        if "Nguyễn Ngọc Ngạn" not in vieneu_model._preset_voices and ref_path.exists():
+            try:
+                vieneu_model.add_voice(
+                    "Nguyễn Ngọc Ngạn",
+                    str(ref_path),
+                    description="MC Nguyễn Ngọc Ngạn - Giọng kể chuyện Paris By Night",
+                    gender="Nam",
+                    save=True
+                )
+            except Exception as e:
+                print(f"  ⚠️ Không thể nạp giọng Nguyễn Ngọc Ngạn: {e}")
+        if actual_voice not in vieneu_model._preset_voices and "ngan" in actual_voice.lower():
+            actual_voice = "Thanh Bình"
     else:
         print(f"\n▶ [Bước 4/6] Khởi tạo Microsoft Edge TTS ({voice})...")
 
