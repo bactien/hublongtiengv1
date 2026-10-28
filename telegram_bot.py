@@ -91,7 +91,10 @@ def get_voice_keyboard() -> InlineKeyboardMarkup:
     """Tạo bàn phím chọn giọng đọc."""
     voices = [
         ("🦜 Adam bựa (Hot)", "voice_Adam bựa"),
-        ("🎙️ Adam chuẩn", "voice_Adam"),
+        ("🎙️ Nguyễn Ngọc Ngạn", "voice_Nguyễn Ngọc Ngạn"),
+        ("🎙️ Thiện Tâm", "voice_Thiện Tâm"),
+        ("🎙️ Ngọc Huyền", "voice_Ngọc Huyền"),
+        ("🎙️ Adam chuẩn", "voice_Adam chuẩn"),
         ("🎙️ Hải Đăng (Nam)", "voice_Hải Đăng"),
         ("🎙️ Mai Anh (Nữ)", "voice_Mai Anh"),
     ]

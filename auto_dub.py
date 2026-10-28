@@ -32,6 +32,29 @@ def format_srt_time(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
 
 
+VOICE_MAP = {
+    "Adam bựa": "Adam bựa",
+    "Nguyễn Ngọc Ngạn": "Thái Sơn",
+    "Ngọc Ngạn": "Thái Sơn",
+    "Thiện Tâm": "Thiền Tâm Đức",
+    "Thiền Tâm Đức": "Thiền Tâm Đức",
+    "Ngọc Huyền": "Ngọc Huyền",
+    "Adam chuẩn": "Adam",
+    "Adam": "Adam",
+    "Hải Đăng": "Hải Đăng",
+    "Mai Anh": "Mai Anh",
+    "Thùy Dung": "Thùy Dung",
+    "Quang Sơn": "Quang Sơn",
+    "Ngọc Trân": "Ngọc Trân",
+    "Thái Sơn": "Thái Sơn",
+    "Mỹ Duyên": "Mỹ Duyên",
+    "Quỳnh Anh": "Quỳnh Anh",
+    "Đức Trí": "Đức Trí",
+    "Kim Thanh": "Kim Thanh",
+    "Thiện Minh": "Thiện Minh",
+}
+
+
 def translate_text(text: str, target_lang: str = "vi") -> str:
     """Dịch văn bản sang tiếng Việt qua Google Translate API."""
     if not text.strip():
@@ -432,12 +455,13 @@ def process_video(
         f.write("\n".join(srt_lines))
     print(f"  💾 Đã lưu phụ đề: {srt_path}")
 
-    # BƯỚC 4: Khởi tạo giọng đọc VieNeu-TTS (Adam bựa) hoặc Edge TTS
+    # BƯỚC 4: Khởi tạo giọng đọc VieNeu-TTS (Adam bựa, Ngọc Ngạn, Thiện Tâm, Ngọc Huyền...) hoặc Edge TTS
     if progress_callback:
         progress_callback(4, 6, f"Lồng tiếng bằng giọng đọc {voice}...")
     vieneu_model = None
+    actual_voice = VOICE_MAP.get(voice, voice)
     if tts_engine == "vieneu":
-        print(f"\n▶ [Bước 4/6] Khởi tạo mô hình VieNeu-TTS (Giọng: {voice})...")
+        print(f"\n▶ [Bước 4/6] Khởi tạo mô hình VieNeu-TTS (Giọng: {voice} -> {actual_voice})...")
         from vieneu import Vieneu
         vieneu_model = Vieneu()
     else:
@@ -451,7 +475,7 @@ def process_video(
 
         # Sinh âm thanh tiếng Việt
         if tts_engine == "vieneu":
-            audio_out = vieneu_model.infer(seg["vi_text"], voice=voice)
+            audio_out = vieneu_model.infer(seg["vi_text"], voice=actual_voice)
             vieneu_model.save(audio_out, raw_tts_path)
         else:
             asyncio.run(generate_edge_tts(seg["vi_text"], voice, raw_tts_path))
